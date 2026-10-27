@@ -1,10 +1,12 @@
 import os
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 import asyncio
 
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,6 +15,8 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
+# Set to e.g. http://localhost:8000 to use DynamoDB Local
+DYNAMODB_ENDPOINT_URL = os.getenv("DYNAMODB_ENDPOINT_URL", "").strip()
 
 _dynamodb_resource = None
 _dynamodb_client = None
@@ -34,6 +38,8 @@ def _session_kwargs() -> Dict[str, str]:
         kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
     if AWS_SESSION_TOKEN:
         kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    if DYNAMODB_ENDPOINT_URL:
+        kwargs["endpoint_url"] = DYNAMODB_ENDPOINT_URL
     return kwargs
 
 
@@ -75,6 +81,25 @@ def serialize_value(value: Any) -> Any:
     if isinstance(value, list):
         return [serialize_value(v) for v in value]
     return value
+
+
+def to_dynamo_value(value: Any) -> Any:
+    """Convert Python values into types DynamoDB accepts (no floats or datetimes)."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: to_dynamo_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_dynamo_value(v) for v in value]
+    return value
+
+
+def _is_conditional_check_failure(exc: ClientError) -> bool:
+    return exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
 
 
 def serialize_item(item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -155,7 +180,7 @@ def get_by_id(table_name: str, item_id: str) -> Optional[Dict[str, Any]]:
 
 def put_item(table_name: str, item: Dict[str, Any]) -> Dict[str, Any]:
     table = get_table(table_name)
-    table.put_item(Item=item)
+    table.put_item(Item=to_dynamo_value(item))
     return item
 
 
@@ -180,23 +205,31 @@ def update_item(table_name: str, key: Dict[str, Any], updates: Dict[str, Any]) -
         name_key = f"#f{index}"
         value_key = f":v{index}"
         names[name_key] = field
-        values[value_key] = value
+        values[value_key] = to_dynamo_value(value)
         expressions.append(f"{name_key} = {value_key}")
 
-    response = table.update_item(
-        Key=key,
-        UpdateExpression="SET " + ", ".join(expressions),
-        ExpressionAttributeNames=names,
-        ExpressionAttributeValues=values,
-        ReturnValues="ALL_NEW",
-    )
+    # Only update existing items; update_item would otherwise create a new one.
+    names["#pk"] = "PK"
+    try:
+        response = table.update_item(
+            Key=key,
+            UpdateExpression="SET " + ", ".join(expressions),
+            ConditionExpression="attribute_exists(#pk)",
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as exc:
+        if _is_conditional_check_failure(exc):
+            return None
+        raise
     return serialize_item(response.get("Attributes"))
 
 
 def append_to_list(table_name: str, key: Dict[str, Any], field: str, value: Any, extra_updates: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     table = get_table(table_name)
-    expression_names = {"#field": field}
-    expression_values: Dict[str, Any] = {":empty": [], ":value": [value]}
+    expression_names = {"#field": field, "#pk": "PK"}
+    expression_values: Dict[str, Any] = {":empty": [], ":value": [to_dynamo_value(value)]}
     set_parts = ["#field = list_append(if_not_exists(#field, :empty), :value)"]
 
     if extra_updates:
@@ -204,16 +237,22 @@ def append_to_list(table_name: str, key: Dict[str, Any], field: str, value: Any,
             name_key = f"#u{index}"
             value_key = f":u{index}"
             expression_names[name_key] = name
-            expression_values[value_key] = item_value
+            expression_values[value_key] = to_dynamo_value(item_value)
             set_parts.append(f"{name_key} = {value_key}")
 
-    response = table.update_item(
-        Key=key,
-        UpdateExpression="SET " + ", ".join(set_parts),
-        ExpressionAttributeNames=expression_names,
-        ExpressionAttributeValues=expression_values,
-        ReturnValues="ALL_NEW",
-    )
+    try:
+        response = table.update_item(
+            Key=key,
+            UpdateExpression="SET " + ", ".join(set_parts),
+            ConditionExpression="attribute_exists(#pk)",
+            ExpressionAttributeNames=expression_names,
+            ExpressionAttributeValues=expression_values,
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as exc:
+        if _is_conditional_check_failure(exc):
+            return None
+        raise
     return serialize_item(response.get("Attributes"))
 
 

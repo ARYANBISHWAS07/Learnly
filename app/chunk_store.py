@@ -1,9 +1,7 @@
 from datetime import datetime
 import uuid
-import os
-from pymongo import MongoClient
 
-from app.database import put_item
+from app.database import delete_item, get_scan_attr, put_item, scan_table
 
 
 def save_chunk_questionnaire(
@@ -12,11 +10,7 @@ def save_chunk_questionnaire(
     metadata: dict,
     chunk_text: str = "",
 ) -> bool:
-    mongodb_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-    database_name = os.getenv("DATABASE_NAME", "scrapper_db")
-    sync_client = MongoClient(mongodb_url)
-    chunk_collection = sync_client[database_name]["chunk_question"]
-
+    item_id = str(uuid.uuid4())
     document = {
         "PK": item_id,
         "id": item_id,
@@ -24,9 +18,15 @@ def save_chunk_questionnaire(
         "questionnaire": questionnaire.get("questions", []) if isinstance(questionnaire, dict) else [],
         "metadata": metadata,
         "chunk_excerpt": (chunk_text or "").strip()[:1200],
-        "created_at": datetime.utcnow()
+        "created_at": datetime.utcnow().isoformat(),
     }
 
-    chunk_collection.insert_one(document)
-    sync_client.close()
+    put_item("chunk_question", document)
     return True
+
+
+def delete_collection_questionnaires(collection_id: str) -> int:
+    items = scan_table("chunk_question", get_scan_attr("collection_id").eq(collection_id))
+    for item in items:
+        delete_item("chunk_question", {"PK": item["PK"]})
+    return len(items)

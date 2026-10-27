@@ -182,7 +182,7 @@ def store_pages(
             progress_callback(
                 page_idx + 1,
                 total_pages,
-                f"Chunking page {page_idx + 1}/{total_pages}: {page['title'][:50]}...",
+                f"Chunking page {page_idx + 1}/{total_pages}: {(page.get('title') or page['url'])[:50]}...",
             )
 
         for chunk_idx, chunk in enumerate(chunks):
@@ -190,7 +190,7 @@ def store_pages(
                 continue
             metadata = {
                 "url": page["url"],
-                "title": page["title"],
+                "title": page.get("title") or "",
                 "chunk_index": chunk_idx,
                 "total_chunks": len(chunks),
             }
@@ -377,6 +377,13 @@ def clear_collection(collection_name: str = None):
             distance=Distance.COSINE,
         ),
     )
+
+
+def delete_collection(collection_name: str = None):
+    """Delete a collection and all of its documents."""
+    name = _safe_collection_name(collection_name)
+    if _collection_exists_in_qdrant(name):
+        get_qdrant_client().delete_collection(collection_name=name)
 
 
 def get_collection_stats(collection_name: str = None) -> Dict[str, Any]:

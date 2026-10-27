@@ -12,6 +12,7 @@ from app import vector_store
 from app import job_store
 from app import collection_store
 from app import learning_node_summary_store
+from app import chunk_store
 from app.socketio_manager import emit_job_update_sync, emit_collection_update_sync, emit_progress_sync
 from app.crawler import handle_chunk
 from app.llm_service import generate_learning_path
@@ -21,7 +22,8 @@ from app.redis_client import cache_get_json, cache_set_json, cache_delete, publi
 
 router = APIRouter(prefix="/collections", tags=["collections"])
 
-CRAWL_LOG_STORE_LIMIT = 5000
+# Crawl logs live inside the job item; DynamoDB items are capped at 400KB.
+CRAWL_LOG_STORE_LIMIT = 1000
 
 
 class CreateCollectionRequest(BaseModel):
@@ -202,6 +204,7 @@ async def create_collection(
     collection_data = {
         "id": collection_id,
         "name": req.name,
+        "vector_collection_name": req.name,
         "url": req.url,
         "status": "pending",
         "pages_count": 0,
@@ -216,6 +219,7 @@ async def create_collection(
     await cache_delete(
         "collections:all",
         f"collection:name:{req.name}",
+        f"collections:user:{req.user_id}",
     )
     await publish_event("collections.updated", {"collection_id": collection_id, "updates": {"status": "pending"}})
     
@@ -285,9 +289,12 @@ async def get_collection(collection_id: str):
     
     # Get vector store stats
     try:
-        stats = vector_store.get_collection_stats(collection.get("name"))
+        stats = await asyncio.to_thread(
+            vector_store.get_collection_stats,
+            collection_store.vector_collection_name(collection),
+        )
         collection["vector_stats"] = stats
-    except:
+    except Exception:
         collection["vector_stats"] = None
     
     await cache_set_json(cache_key, collection, ttl_seconds=60)
@@ -315,7 +322,7 @@ async def get_collection_by_name(name: str):
 @router.patch("/{collection_id}")
 async def update_collection(collection_id: str, req: UpdateCollectionRequest):
     """Update collection metadata."""
-    updates = {k: v for k, v in req.dict().items() if v is not None}
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
     
     if not updates:
         raise HTTPException(
@@ -323,6 +330,23 @@ async def update_collection(collection_id: str, req: UpdateCollectionRequest):
             detail="No updates provided"
         )
     
+    existing = await collection_store.get_collection_by_id(collection_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found"
+        )
+
+    if "name" in updates and updates["name"] != existing.get("name"):
+        same_name = await collection_store.get_collection_by_name(updates["name"])
+        if same_name and same_name.get("id") != collection_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Collection '{updates['name']}' already exists"
+            )
+        # Embeddings are stored under the original name; keep pointing at them after a rename.
+        updates["vector_collection_name"] = collection_store.vector_collection_name(existing)
+
     collection = await collection_store.update_collection(collection_id, updates)
     if not collection:
         raise HTTPException(
@@ -332,7 +356,9 @@ async def update_collection(collection_id: str, req: UpdateCollectionRequest):
     await cache_delete(
         "collections:all",
         f"collection:id:{collection_id}",
+        f"collection:name:{existing.get('name')}",
         f"collection:name:{collection.get('name')}",
+        f"collections:user:{collection.get('user_id')}",
     )
     await publish_event("collections.updated", {"collection_id": collection_id, "updates": updates})
     return collection
@@ -350,9 +376,13 @@ async def delete_collection(collection_id: str):
     
     # Delete from vector store
     try:
-        vector_store.clear_collection(collection.get("name"))
-    except:
-        pass
+        await asyncio.to_thread(vector_store.delete_collection, collection_store.vector_collection_name(collection))
+    except Exception as exc:
+        print(f"Failed to delete vector collection for {collection_id}: {exc}")
+
+    # Delete derived data so it doesn't linger (e.g. quiz questions for a deleted collection)
+    await asyncio.to_thread(chunk_store.delete_collection_questionnaires, collection_id)
+    await learning_node_summary_store.replace_collection_node_summaries(collection_id, [])
     
     # Delete associated job
     if collection.get("job_id"):
@@ -364,6 +394,7 @@ async def delete_collection(collection_id: str):
         "collections:all",
         f"collection:id:{collection_id}",
         f"collection:name:{collection.get('name')}",
+        f"collections:user:{collection.get('user_id')}",
     )
     await publish_event("collections.updated", {"collection_id": collection_id, "deleted": True})
     
@@ -502,7 +533,7 @@ async def generate_learning_path_from_urls(req: GenerateLearningPathRequest):
         )
     
     try:
-        result = generate_learning_path(req.urls)
+        result = await asyncio.to_thread(generate_learning_path, req.urls)
         return result
     except ValueError as e:
         raise HTTPException(
@@ -553,7 +584,7 @@ async def generate_learning_path_for_collection(collection_id: str):
         )
     
     try:
-        result = generate_learning_path(routes_crawled)
+        result = await asyncio.to_thread(generate_learning_path, routes_crawled)
         await learning_node_summary_store.replace_collection_node_summaries(
             collection_id=collection_id,
             nodes=result.get("nodes", []),

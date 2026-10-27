@@ -1,8 +1,15 @@
 from datetime import datetime
 from typing import Dict, List, Optional
 from collections import defaultdict
+import asyncio
+from functools import lru_cache
 import math
 import re
+
+from app.database import get_by_id, get_scan_attr, put_item, scan_table, update_item
+
+# Quiz and chat sessions share the quiz_sessions table; entity_type tells them apart.
+QUIZ_SESSION_ENTITY = "quiz_session"
 
 GENERIC_SOURCE_PATTERNS = [
     r"robots\.txt",
@@ -72,6 +79,13 @@ def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     return dot / (norm1 * norm2)
 
 
+@lru_cache(maxsize=64)
+def _embed_query_cached(query: str) -> tuple:
+    from app.vector_store import embeddings_model
+
+    return tuple(embeddings_model.embed_query(query))
+
+
 def _semantic_score(focus_query: str, question: dict) -> float:
     if not focus_query.strip():
         return 0.0
@@ -87,7 +101,7 @@ def _semantic_score(focus_query: str, question: dict) -> float:
     if not text:
         return 0.0
 
-    query_vec = embeddings_model.embed_query(focus_query)
+    query_vec = list(_embed_query_cached(focus_query))
     text_vec = embeddings_model.embed_query(text)
     return _cosine_similarity(query_vec, text_vec)
 
@@ -172,40 +186,55 @@ def filter_core_topic_with_labels(question_bank: List[dict], labels: Dict[str, s
     return result
 
 
+def _questions_from_chunk_doc(doc: dict) -> List[dict]:
+    raw_questions = doc.get("questionnaire", [])
+    if not isinstance(raw_questions, list):
+        return []
+    questions = []
+    for raw_question in raw_questions:
+        normalized = _normalize_mcq_question(raw_question, doc)
+        if normalized:
+            questions.append(normalized)
+    return questions
+
+
 async def get_collection_mcq_bank(collection_id: str) -> List[dict]:
-    from app.database import get_collection
-
-    chunk_collection = get_collection("chunk_question")
-    cursor = chunk_collection.find({"collection_id": collection_id})
-
+    docs = await asyncio.to_thread(
+        scan_table,
+        "chunk_question",
+        get_scan_attr("collection_id").eq(collection_id),
+    )
     bank: List[dict] = []
-    async for doc in cursor:
-        raw_questions = doc.get("questionnaire", [])
-        if not isinstance(raw_questions, list):
-            continue
-        for raw_question in raw_questions:
-            normalized = _normalize_mcq_question(raw_question, doc)
-            if normalized:
-                bank.append(normalized)
+    for doc in docs:
+        bank.extend(_questions_from_chunk_doc(doc))
     return bank
 
 
-async def create_quiz_session(document: dict) -> dict:
-    from app.database import get_collection
+async def get_mcq_counts_by_collection() -> Dict[str, int]:
+    """Count valid MCQ questions per collection with a single table scan."""
+    docs = await asyncio.to_thread(scan_table, "chunk_question")
+    counts: Dict[str, int] = defaultdict(int)
+    for doc in docs:
+        collection_id = doc.get("collection_id")
+        if collection_id:
+            counts[collection_id] += len(_questions_from_chunk_doc(doc))
+    return counts
 
-    quiz_sessions = get_collection("quiz_sessions")
-    await quiz_sessions.insert_one(document.copy())
+
+async def create_quiz_session(document: dict) -> dict:
+    item = {
+        "PK": document["id"],
+        "entity_type": QUIZ_SESSION_ENTITY,
+        **document,
+    }
+    await asyncio.to_thread(put_item, "quiz_sessions", item)
     return document
 
 
 async def get_quiz_session(session_id: str) -> Optional[dict]:
-    from app.database import get_collection
-
-    quiz_sessions = get_collection("quiz_sessions")
-    doc = await quiz_sessions.find_one({"id": session_id})
-    if not doc:
+    doc = await asyncio.to_thread(get_by_id, "quiz_sessions", session_id)
+    if not doc or doc.get("entity_type") != QUIZ_SESSION_ENTITY:
         return None
-    doc.pop("_id", None)
     return doc
 
 
@@ -216,27 +245,16 @@ async def complete_quiz_session(
     wrong_answers: List[dict],
     llm_suggestions: str,
 ) -> Optional[dict]:
-    from app.database import get_collection
-
-    quiz_sessions = get_collection("quiz_sessions")
-    completed_at = datetime.utcnow()
-    update_result = await quiz_sessions.update_one(
-        {"id": session_id},
+    return await asyncio.to_thread(
+        update_item,
+        "quiz_sessions",
+        {"PK": session_id},
         {
-            "$set": {
-                "status": "completed",
-                "score": score,
-                "answers": answers,
-                "wrong_answers": wrong_answers,
-                "llm_suggestions": llm_suggestions,
-                "completed_at": completed_at,
-            }
-        }
+            "status": "completed",
+            "score": score,
+            "answers": answers,
+            "wrong_answers": wrong_answers,
+            "llm_suggestions": llm_suggestions,
+            "completed_at": datetime.utcnow().isoformat(),
+        },
     )
-    if update_result.matched_count == 0:
-        return None
-    result = await quiz_sessions.find_one({"id": session_id})
-    if not result:
-        return None
-    result.pop("_id", None)
-    return result
