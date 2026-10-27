@@ -19,6 +19,19 @@ from app.database import (
 )
 from app.redis_client import cache_delete_sync, publish_event_sync
 
+# Chat sessions share the quiz_sessions table with quiz sessions; entity_type tells them apart.
+CHAT_SESSION_ENTITY = "chat_session"
+
+
+def _is_chat_session(item: Optional[dict]) -> bool:
+    # Sessions created before entity_type existed have no type and are chat sessions.
+    return bool(item) and item.get("entity_type", CHAT_SESSION_ENTITY) == CHAT_SESSION_ENTITY
+
+
+def vector_collection_name(collection: dict) -> Optional[str]:
+    """Qdrant collection holding this collection's embeddings (fixed at creation, survives renames)."""
+    return collection.get("vector_collection_name") or collection.get("name")
+
 
 async def create_collection(collection_data: dict) -> dict:
     collection_id = collection_data.get("id") or collection_data.get("PK") or str(uuid.uuid4())
@@ -57,6 +70,8 @@ def update_collection_sync(collection_id: str, updates: dict) -> bool:
         keys = ["collections:all", f"collection:id:{collection_id}"]
         if collection and collection.get("name"):
             keys.append(f"collection:name:{collection['name']}")
+        if collection and collection.get("user_id"):
+            keys.append(f"collections:user:{collection['user_id']}")
         cache_delete_sync(*keys)
         publish_event_sync("collections.updated", {"collection_id": collection_id, "updates": updates})
         return collection is not None
@@ -85,6 +100,7 @@ async def create_chat_session(collection_id: str, session_data: dict) -> dict:
     item = {
         "PK": session_id,
         "id": session_id,
+        "entity_type": CHAT_SESSION_ENTITY,
         **session_data,
     }
     await asyncio.to_thread(put_item, "quiz_sessions", item)
@@ -93,7 +109,7 @@ async def create_chat_session(collection_id: str, session_data: dict) -> dict:
 
 async def get_chat_session(collection_id: str, session_id: str) -> Optional[dict]:
     session = await asyncio.to_thread(get_by_id, "quiz_sessions", session_id)
-    if session and session.get("collection_id") == collection_id:
+    if _is_chat_session(session) and session.get("collection_id") == collection_id:
         return session
     return None
 
@@ -104,6 +120,7 @@ async def get_all_chat_sessions(collection_id: str) -> List[dict]:
         "quiz_sessions",
         get_scan_attr("collection_id").eq(collection_id),
     )
+    sessions = [session for session in sessions if _is_chat_session(session)]
     sessions.sort(key=lambda item: item.get("created_at", ""))
     return sessions
 

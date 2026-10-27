@@ -1,4 +1,5 @@
 from datetime import datetime
+import asyncio
 import random
 import uuid
 from fastapi import APIRouter, HTTPException, status
@@ -24,16 +25,17 @@ async def list_quiz_ready_collections():
     List collections that currently have enough MCQ questions to run a quiz.
     """
     collections = await collection_store.get_all_collections(limit=200)
+    question_counts = await quiz_store.get_mcq_counts_by_collection()
     result = []
     for coll in collections:
-        question_bank = await quiz_store.get_collection_mcq_bank(coll["id"])
-        if not question_bank:
+        available = question_counts.get(coll["id"], 0)
+        if not available:
             continue
         result.append({
             "collection_id": coll["id"],
             "name": coll.get("name", ""),
             "url": coll.get("url", ""),
-            "available_questions": len(question_bank),
+            "available_questions": available,
         })
     return {"collections": result, "count": len(result)}
 
@@ -57,7 +59,8 @@ async def start_quiz(req: QuizStartRequest):
         )
 
     question_bank = await quiz_store.get_collection_mcq_bank(req.collection_id)
-    filtered_bank = quiz_store.filter_questions_by_scope(
+    filtered_bank = await asyncio.to_thread(
+        quiz_store.filter_questions_by_scope,
         question_bank=question_bank,
         scope_mode=req.scope_mode,
         focus_query=req.focus_query,
@@ -68,7 +71,7 @@ async def start_quiz(req: QuizStartRequest):
     )
 
     if req.scope_mode == "focused" and req.use_llm_classifier and req.focus_query:
-        labels = llm_service.classify_quiz_questions(filtered_bank, req.focus_query)
+        labels = await asyncio.to_thread(llm_service.classify_quiz_questions, filtered_bank, req.focus_query)
         filtered_bank = quiz_store.filter_core_topic_with_labels(filtered_bank, labels)
 
     if len(filtered_bank) < req.question_count:
@@ -198,7 +201,8 @@ async def submit_quiz(quiz_session_id: str, req: QuizSubmitRequest):
                 "explanation": question.get("explanation", ""),
             })
 
-    llm_suggestions = llm_service.generate_quiz_improvement_feedback(
+    llm_suggestions = await asyncio.to_thread(
+        llm_service.generate_quiz_improvement_feedback,
         score=score,
         total_questions=len(question_map),
         wrong_answers=wrong_answers,
@@ -241,4 +245,10 @@ async def get_quiz_session(quiz_session_id: str):
             detail="Quiz session not found",
         )
 
+    if session.get("status") != "completed":
+        # Don't reveal answers before the quiz is submitted.
+        session["questions"] = [
+            {k: v for k, v in q.items() if k not in {"correct_option", "explanation"}}
+            for q in session.get("questions", [])
+        ]
     return session

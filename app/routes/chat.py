@@ -13,6 +13,7 @@ import re
 from app import collection_store
 from app import vector_store
 from app import llm_service
+from app.routes.scrape import get_temp_website_session
 
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -180,7 +181,7 @@ async def send_message(
             detail="Session not found"
         )
     
-    collection_name = collection.get('name')
+    collection_name = collection_store.vector_collection_name(collection)
     prior_messages = session.get("messages", [])
     user_message_id = str(uuid.uuid4())
     user_message = {
@@ -255,7 +256,7 @@ async def send_message(
                 'session_id': session_id,
                 'message': assistant_message
             }, room=room)
-        except:
+        except Exception:
             pass  # Socket.IO not available
         
         return {

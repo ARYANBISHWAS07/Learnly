@@ -46,7 +46,7 @@ jobs:
     name: Deploy to AWS EC2
     runs-on: amazon-linux-2
     needs: backend-checks
-    if: github.event_name == 'push' && github.ref == 'refs/heads/dev-2'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Deploy latest code on EC2

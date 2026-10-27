@@ -33,9 +33,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# Copy .env file (loaded by docker-compose and dotenv)
-COPY .env .env
-
 # Copy application code
 COPY . .
 

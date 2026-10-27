@@ -9,7 +9,7 @@ from app.crawler import crawl_sync
 from app import vector_store
 from app.database import connect_to_dynamodb, close_dynamodb_connection
 from app.redis_client import connect_redis, close_redis
-from app.routes import users_router, chat_router, collections_router, quizzes_router
+from app.routes import users_router, chat_router, collections_router, quizzes_router, scrape_router
 from app.socketio_manager import socket_app, sio, set_main_loop
 # from extension.main import app as extension_app
 
@@ -54,6 +54,7 @@ app.include_router(users_router)
 app.include_router(chat_router)
 app.include_router(collections_router)
 app.include_router(quizzes_router)
+app.include_router(scrape_router)
 
 
 # Mount Socket.IO app at /socket.io path

@@ -179,7 +179,7 @@ async def send_message(sid, data):
         await sio.emit('error', {'message': 'Collection not found'}, to=sid)
         return
     
-    collection_name = collection.get('name')
+    collection_name = collection_store.vector_collection_name(collection)
     
     # Create or get session
     if not session_id:
@@ -194,6 +194,9 @@ async def send_message(sid, data):
         }
         await collection_store.create_chat_session(collection_id, session_data)
         await sio.emit('session_created', {'session_id': session_id}, to=sid)
+    elif not await collection_store.get_chat_session(collection_id, session_id):
+        await sio.emit('error', {'message': 'Session not found'}, to=sid)
+        return
     
     user_message_id = str(uuid.uuid4())
     user_message = {
@@ -207,8 +210,11 @@ async def send_message(sid, data):
     # Save user message
     await collection_store.add_message_to_session(collection_id, session_id, user_message)
     
-    # Broadcast user message to chat room
+    # Broadcast user message to chat room; make sure the sender is in it
+    # (a newly created session has no members yet).
     room = f"chat_{collection_id}_{session_id}"
+    await sio.enter_room(sid, room)
+    _track_join(room, sid)
     await sio.emit('new_message', {
         'session_id': session_id,
         'message': user_message
@@ -240,7 +246,7 @@ async def send_message(sid, data):
             "role": "assistant",
             "content": answer,
             "sources": [
-                {"url": s["url"], "title": s["title"], "similarity": s["similarity"]}
+                {"url": s.get("url", ""), "title": s.get("title", ""), "similarity": s.get("similarity", 0.0)}
                 for s in sources
             ],
             "created_at": datetime.utcnow().isoformat()

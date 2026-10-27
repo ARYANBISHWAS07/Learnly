@@ -28,7 +28,10 @@ services:
     container_name: crawler-backend
     restart: unless-stopped
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
     env_file:
       - .env
     environment:
