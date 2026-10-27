@@ -15,6 +15,8 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
+# Set to e.g. http://localhost:8000 to use DynamoDB Local
+DYNAMODB_ENDPOINT_URL = os.getenv("DYNAMODB_ENDPOINT_URL", "").strip()
 
 _dynamodb_resource = None
 _dynamodb_client = None
@@ -36,6 +38,8 @@ def _session_kwargs() -> Dict[str, str]:
         kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
     if AWS_SESSION_TOKEN:
         kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    if DYNAMODB_ENDPOINT_URL:
+        kwargs["endpoint_url"] = DYNAMODB_ENDPOINT_URL
     return kwargs
 
 
